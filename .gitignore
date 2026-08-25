@@ -1,0 +1,16 @@
+# Large build artifacts (several GB)
+sonic-buildimage.vs.zip
+sonic-extracted/
+sonic-buildimage/
+
+# Auto-generated config
+sonic-buildimage/rules/config.user
+
+# Deployment logs
+deployment/logs/
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
