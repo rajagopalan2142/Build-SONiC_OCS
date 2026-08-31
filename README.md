@@ -15,7 +15,7 @@ The script is designed to handle the full workflow in one run:
 
 ## Files
 
-- `setup_and_deploy_vs.sh` — main deployment automation script
+- `SetupScript.sh` — main deployment automation script
 - `sonic-buildimage/` — cloned SONiC build tree used for image generation
 - `deployment/` — generated config, logs, and Compose files at runtime
 
@@ -40,7 +40,7 @@ A typical host should have:
 Run the script as root or with sudo:
 
 ```bash
-sudo ./setup_and_deploy_vs.sh
+sudo ./SetupScript.sh
 ```
 
 The script will:
@@ -106,7 +106,7 @@ export PLATFORM=ocs-kvm
 export SONIC_BUILD_JOBS=8
 export SONIC_BUILD_MEMORY=16g
 export BUILD_SKIP_TEST=y
-sudo -E ./setup_and_deploy_vs.sh
+sudo -E ./SetupScript.sh
 ```
 
 Useful variables:
@@ -165,7 +165,7 @@ The script attempts to auto-tune build jobs and memory, but you may need to adju
 ```bash
 export SONIC_BUILD_JOBS=4
 export SONIC_BUILD_MEMORY=8g
-sudo -E ./setup_and_deploy_vs.sh
+sudo -E ./SetupScript.sh
 ```
 
 ### Images are missing
