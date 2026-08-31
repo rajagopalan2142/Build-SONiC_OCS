@@ -7,9 +7,9 @@ The script is designed to handle the full workflow in one run:
 - install host dependencies
 - install Docker and Docker Compose
 - clone or refresh the SONiC build repository
-- build missing VS images or load prebuilt archives
+- build missing OCS images or load prebuilt archives
 - create deployment config and network files
-- launch the SONiC VS containers
+- launch the SONiC OCS containers
 - load configuration into Redis CONFIG_DB
 - report status
 
