@@ -184,7 +184,7 @@ docker logs sonic-gnmi
 
 - The script is designed for lab/test environments and virtual switch deployments.
 - It may take a long time to build SONiC images, especially on smaller machines.
-- The script uses Docker Compose to orchestrate the VS stack and creates a simulated network layer for the switch.
+- The script uses Docker Compose to orchestrate the ocs stack and creates a simulated network layer for the switch.
 
 ## License
 
