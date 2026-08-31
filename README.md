@@ -40,7 +40,6 @@ A typical host should have:
 Run the script as root or with sudo:
 
 ```bash
-cd ~/build.sh
 sudo ./setup_and_deploy_vs.sh
 ```
 
