@@ -11,14 +11,7 @@
 #   6. Loads configuration into CONFIG_DB (Redis)
 #
 # Usage:
-#   bash setup_and_deploy_vs.sh              # Full setup + deploy
-#   bash setup_and_deploy_vs.sh --deps-only  # Install dependencies only
-#   bash setup_and_deploy_vs.sh --build-only # Build images only (after deps)
-#   bash setup_and_deploy_vs.sh --deploy-only # Deploy only (images must exist)
-#   bash setup_and_deploy_vs.sh --stop       # Stop all containers
-#   bash setup_and_deploy_vs.sh --cleanup    # Stop containers + remove networks
-#   bash setup_and_deploy_vs.sh --status     # Show status
-#   bash setup_and_deploy_vs.sh --logs       # Follow logs
+#   bash setup_and_deploy_vs.sh
 #
 set -euo pipefail
 
@@ -33,15 +26,50 @@ HWSKU_DIR="${DEPLOY_DIR}/hwsku"
 LOG_DIR="${DEPLOY_DIR}/logs"
 COMPOSE_FILE="${DEPLOY_DIR}/docker-compose.yml"
 
-# Build image source
-BUILD_REPO="https://github.com/sonic-net/sonic-buildimage.git"
-BUILD_BRANCH="${SONIC_BRANCH:-master}"
+# Build image source (sonic-ocs upstream repo)
+BUILD_REPO="https://github.com/sonic-ocs/sonic-buildimage.git"
+BUILD_BRANCH="${SONIC_BRANCH:-ocs-dev}"
 BUILD_DIR="${PROJECT_DIR}/sonic-buildimage"
 TARGET_DIR="${PROJECT_DIR}/sonic-extracted/sonic-buildimage.vs/target"
 
 # Build settings (override via environment)
-PLATFORM="${PLATFORM:-vs}"
+PLATFORM="${PLATFORM:-ocs-kvm}"
 BUILD_SKIP_TEST="${BUILD_SKIP_TEST:-y}"
+
+###############################################################################
+# OCS-KVM Container Definitions
+###############################################################################
+# Core containers required for OCS-KVM platform
+CORE_IMAGES=(
+    "docker-syncd-ocs-kvm:latest"
+    "docker-orchagent:latest"
+    "docker-database:latest"
+    "docker-eventd:latest"
+    "docker-lldp:latest"
+    "docker-sonic-gnmi:latest"
+)
+
+# Optional containers (enabled via build flags)
+OPTIONAL_IMAGES=(
+    "docker-sonic-bmp:latest"
+    "docker-sonic-otel:latest"
+    "docker-nat:latest"
+    "docker-mux:latest"
+    "docker-sflow:latest"
+    "docker-sonic-mgmt-framework:latest"
+    "docker-snmp:latest"
+    "docker-fpm-frr:latest"
+    "docker-stp:latest"
+    "docker-macsec:latest"
+    "docker-iccpd:latest"
+    "docker-router-advertiser:latest"
+    "docker-platform-monitor:latest"
+    "docker-sysmgr:latest"
+    "docker-teamd:latest"
+)
+
+# All images (core + optional)
+ALL_IMAGES=("${CORE_IMAGES[@]}" "${OPTIONAL_IMAGES[@]}")
 
 # Auto-detect build jobs and memory based on host resources.
 # Rule of thumb (per sonic-buildimage README):
@@ -137,94 +165,36 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
 log_success() { echo -e "${GREEN}[DONE]${NC} $1"; }
 
-dashboard_header() {
-    echo ""
-    echo "============================================================"
-    echo " SONiC VS SETUP DASHBOARD"
-    echo "============================================================"
+progress_format_eta() {
+    local seconds="$1"
+    if [ "$seconds" -lt 0 ]; then
+        seconds=0
+    fi
+    local h=$((seconds / 3600))
+    local m=$(((seconds % 3600) / 60))
+    local s=$((seconds % 60))
+    printf '%02d:%02d:%02d' "$h" "$m" "$s"
 }
 
-dashboard_bar() {
-    local label="$1"
-    local current="$2"
-    local total="$3"
-    local width=24
-    local filled=0
-    [ "$total" -gt 0 ] && filled=$((current * width / total))
-    [ "$filled" -gt "$width" ] && filled=$width
-    local empty=$((width - filled))
-    printf "%-22s [" "$label"
-    printf '%*s' "$filled" '' | tr ' ' '#'
-    printf '%*s' "$empty" '' | tr ' ' '-'
-    printf "] %s/%s\n" "$current" "$total"
+progress_render() {
+    local message="${1:-Running}"
+
+    printf '\033[H\033[2K'
+    printf '%s' "$message"
+    printf '\n\033[2K'
+    printf '%s' '----------------------------------------'
+    printf '\033[2;1H'
 }
 
-show_dashboard() {
-    dashboard_header
-    printf " Host: %-45s\n" "$(hostname 2>/dev/null || echo unknown)"
-    printf " Time: %-45s\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo ""
+progress_start() {
+    PROGRESS_TOTAL_START_EPOCH=$SECONDS
+    printf '\033[?25l\033[H\033[2J'
+    progress_render "Initializing OCS-KVM setup"
+}
 
-    if [ -n "${DETECTED_CPUS:-}" ]; then
-        echo "Build resources"
-        printf "  CPUs: %-8s RAM: %-8s Free disk: %s\n" \
-            "${DETECTED_CPUS}" "${DETECTED_RAM_GB} GB" "${DETECTED_DISK_GB} GB"
-        printf "  Jobs: %-8s Memory limit: %s\n" \
-            "${SONIC_BUILD_JOBS}" "${DETECTED_BUILD_MEMORY}"
-        echo ""
-    fi
-
-    echo "Required images"
-    local images=(
-        "docker-gbsyncd-vs:latest"
-        "docker-database:latest"
-        "docker-orchagent:latest"
-        "docker-eventd:latest"
-        "docker-lldp:latest"
-    )
-    local present=0
-    local image
-    for image in "${images[@]}"; do
-        if command -v docker &>/dev/null && docker image inspect "$image" &>/dev/null; then
-            printf "  [OK]   %s\n" "$image"
-            present=$((present + 1))
-        else
-            printf "  [TODO] %s\n" "$image"
-        fi
-    done
-    dashboard_bar "Images" "$present" "${#images[@]}"
-    echo ""
-
-    echo "Deployment"
-    if command -v docker &>/dev/null && docker compose -f "${COMPOSE_FILE}" ps --status running -q 2>/dev/null | grep -q .; then
-        local running
-        running=$(docker compose -f "${COMPOSE_FILE}" ps --status running -q 2>/dev/null | wc -l)
-        dashboard_bar "Containers running" "$running" 5
-    else
-        dashboard_bar "Containers running" 0 5
-    fi
-    if command -v docker &>/dev/null && docker exec sonic-database redis-cli ping &>/dev/null; then
-        echo "  Redis:              READY"
-    else
-        echo "  Redis:              TODO (start database container)"
-    fi
-    if ip link show sonic-vs-br &>/dev/null 2>&1; then
-        echo "  VS bridge:          READY"
-    else
-        echo "  VS bridge:          TODO (run deploy)"
-    fi
-    echo ""
-
-    echo "Next actions"
-    if [ "$present" -lt "${#images[@]}" ]; then
-        echo "  1. Load the missing image archives or build from source"
-    elif ! command -v docker &>/dev/null || ! docker compose -f "${COMPOSE_FILE}" ps --status running -q 2>/dev/null | grep -q .; then
-        echo "  1. Run: sudo bash $0 --deploy-only"
-    else
-        echo "  1. Check service health and CONFIG_DB"
-        echo "  2. Run: bash $0 --logs"
-    fi
-    echo "============================================================"
+progress_finish() {
+    progress_render "Deployment complete"
+    printf '\n\033[?25h'
 }
 
 ###############################################################################
@@ -285,15 +255,37 @@ install_packages() {
 
 install_python_tools() {
     log_step "Installing Python tools (jinjanator)..."
-    pip3 install --user --quiet jinjanator 2>/dev/null || \
-        pip3 install --quiet jinjanator 2>/dev/null || \
-        log_warn "Could not install jinjanator via pip3"
 
-    # Verify j2 command works
-    if command -v j2 &>/dev/null || command -v ~/.local/bin/j2 &>/dev/null; then
+    # Install system-wide when run as root so all users (including the build user) can use j2
+    if [ "$(id -u)" -eq 0 ]; then
+        pip3 install --quiet jinjanator 2>/dev/null || \
+            pip3 install --user --quiet jinjanator 2>/dev/null || \
+            log_warn "Could not install jinjanator"
+    else
+        pip3 install --user --quiet jinjanator 2>/dev/null || \
+            pip3 install --quiet jinjanator 2>/dev/null || \
+            log_warn "Could not install jinjanator"
+    fi
+
+    # Verify j2 command works for root
+    if command -v j2 &>/dev/null || [ -f /usr/local/bin/j2 ] || [ -f /root/.local/bin/j2 ] || [ -f ~/.local/bin/j2 ]; then
         log_success "j2/jinjanator installed"
     else
         log_warn "j2 command not found in PATH — may need to add ~/.local/bin to PATH"
+    fi
+
+    # Also install for the build user (may differ from root when script runs via sudo)
+    local build_user
+    build_user="${SUDO_USER:-$(whoami)}"
+    if [ "$(id -u)" -eq 0 ] && [ -n "$build_user" ] && [ "$build_user" != "root" ]; then
+        local build_home
+        build_home="$(eval echo ~"$build_user")"
+        local build_user_j2="${build_home}/.local/bin/j2"
+        if [ ! -f "$build_user_j2" ] && ! command -v j2 &>/dev/null; then
+            log_info "Installing jinjanator for build user '${build_user}'..."
+            sudo -H -u "$build_user" pip3 install --user --quiet jinjanator 2>/dev/null || \
+                log_warn "Could not install jinjanator for user '${build_user}'"
+        fi
     fi
 }
 
@@ -411,24 +403,70 @@ install_docker_compose_plugin() {
 clone_build_repo() {
     log_step "Setting up sonic-buildimage repository..."
 
+    local clone_user
+    clone_user="${SUDO_USER:-$(whoami)}"
+    local clone_home
+    clone_home="$(eval echo ~"$clone_user")"
+
     if [ -d "${BUILD_DIR}/.git" ]; then
         log_info "Repository already cloned at ${BUILD_DIR}"
+
+        # Fix ownership if the repo was cloned by root (e.g. from a prior run)
+        local repo_owner
+        repo_owner=$(stat -c '%U' "$BUILD_DIR" 2>/dev/null || echo "root")
+        if [ "$repo_owner" != "$clone_user" ]; then
+            log_info "Fixing ownership of ${BUILD_DIR} (was ${repo_owner}, needs ${clone_user})"
+            chown -R "$clone_user:$(id -gn "$clone_user" 2>/dev/null || echo "$clone_user")" "$BUILD_DIR" 2>/dev/null || true
+        fi
+
+        # Also fix well-known directories that the build creates as root
+        for dir in "${BUILD_DIR}/target" \
+                   "${BUILD_DIR}/sonic-slave-bookworm" \
+                   "${BUILD_DIR}/sonic-slave-bullseye" \
+                   "${BUILD_DIR}/sonic-slave-buster" \
+                   "${BUILD_DIR}/fsroot.docker.bookworm" \
+                   "${BUILD_DIR}/fsroot.docker.bullseye" \
+                   "${BUILD_DIR}/fsroot.docker.buster" \
+                   "${BUILD_DIR}/fsroot.docker.trixie"; do
+            if [ -d "$dir" ]; then
+                local d_owner
+                d_owner=$(stat -c '%U' "$dir" 2>/dev/null || echo "root")
+                if [ "$d_owner" != "$clone_user" ]; then
+                    chown -R "$clone_user:$(id -gn "$clone_user" 2>/dev/null || echo "$clone_user")" "$dir" 2>/dev/null || true
+                fi
+            fi
+        done
+
         cd "$BUILD_DIR"
-        git fetch --all 2>/dev/null || true
-        git checkout "$BUILD_BRANCH" 2>/dev/null || true
-        git pull origin "$BUILD_BRANCH" 2>/dev/null || true
-        git submodule update --init --recursive 2>/dev/null || true
+        HOME="$clone_home" git fetch --all 2>/dev/null || true
+        HOME="$clone_home" git checkout "$BUILD_BRANCH" 2>/dev/null || true
+        HOME="$clone_home" git pull origin "$BUILD_BRANCH" 2>/dev/null || true
+        HOME="$clone_home" git submodule update --init --recursive 2>/dev/null || true
         log_info "Repository updated"
         return 0
     fi
 
-    log_info "Cloning sonic-buildimage (branch: ${BUILD_BRANCH})..."
-    git clone --recurse-submodules -b "$BUILD_BRANCH" "$BUILD_REPO" "$BUILD_DIR"
+    log_info "Cloning sonic-buildimage (branch: ${BUILD_BRANCH}) as user '${clone_user}'..."
+    # Clone as the original user so that `make` (which refuses root) works
+    HOME="$clone_home" git clone --recurse-submodules -b "$BUILD_BRANCH" "$BUILD_REPO" "$BUILD_DIR"
+    chown -R "$clone_user:$(id -gn "$clone_user" 2>/dev/null || echo "$clone_user")" "$BUILD_DIR" 2>/dev/null || true
     log_success "Repository cloned"
 }
 
 build_vs_images() {
-    log_step "Building SONiC VS images..."
+    log_step "Building SONiC images..."
+
+    # The SONiC Makefile refuses to run as root.
+    # When called via sudo, delegate all `make` steps to the original user.
+    local run_user
+    run_user="${SUDO_USER:-$(whoami)}"
+    local run_home
+    run_home="$(eval echo ~"$run_user")"
+    local run_as=""
+    if [ "$(id -u)" -eq 0 ] && [ -n "$run_user" ] && [ "$run_user" != "root" ]; then
+        run_as="sudo -H -u ${run_user}"
+        log_info "Running make as '${run_user}' (root builds are blocked by SONiC Makefile)"
+    fi
 
     # Auto-tune jobs and memory for this host (idempotent, env overrides win)
     detect_build_resources
@@ -438,6 +476,9 @@ build_vs_images() {
     log_info "Build memory: ${DETECTED_BUILD_MEMORY}"
     log_info "Skip tests: ${BUILD_SKIP_TEST}"
     log_info "Build dir: ${BUILD_DIR}"
+
+    # --- Build log file for HUD to read ---
+    BUILD_LOG="${BUILD_DIR}/build.log"
 
     # Persist memory limit so the build container doesn't OOM the host
     if [ -d "${BUILD_DIR}" ]; then
@@ -451,31 +492,86 @@ build_vs_images() {
             } >> "${BUILD_DIR}/rules/config.user"
             log_info "Wrote ${BUILD_DIR}/rules/config.user (memory=${DETECTED_BUILD_MEMORY}, jobs=${SONIC_BUILD_JOBS})"
         fi
+        # Ensure the build user owns the rules dir
+        chown -R "${run_user}:$(id -gn "$run_user" 2>/dev/null || echo "$run_user")" "${BUILD_DIR}/rules" 2>/dev/null || true
     fi
 
-    cd "$BUILD_DIR"
+    # Fix ownership of stale root-owned directories from prior failed builds.
+    # The build creates many subdirectories as root before the non-root check fires;
+    # fix them here so the non-root `make` steps can write into them.
+    if [ "$(id -u)" -eq 0 ] && [ -n "$run_user" ] && [ "$run_user" != "root" ]; then
+        log_info "Fixing ownership of build artifacts in ${BUILD_DIR}..."
+        chown -R "${run_user}:$(id -gn "$run_user" 2>/dev/null || echo "$run_user")" \
+            "${BUILD_DIR}/target" \
+            "${BUILD_DIR}/sonic-slave-bookworm" \
+            "${BUILD_DIR}/sonic-slave-bullseye" \
+            "${BUILD_DIR}/sonic-slave-buster" \
+            "${BUILD_DIR}/sonic-slave-trixie" \
+            "${BUILD_DIR}/fsroot.docker.bookworm" \
+            "${BUILD_DIR}/fsroot.docker.bullseye" \
+            "${BUILD_DIR}/fsroot.docker.buster" \
+            "${BUILD_DIR}/fsroot.docker.trixie" \
+            2>/dev/null || true
+    fi
+
+    # Ensure ~/.local/bin is in PATH for the build user (j2/jinjanator lives there from pip3 --user)
+    local build_path="${run_home}/.local/bin:${PATH}"
+    if [ -n "$run_as" ] && [ -d "${run_home}/.local/bin" ]; then
+        log_info "Ensuring ${run_home}/.local/bin is in PATH for build (j2/jinjanator)"
+    fi
 
     # One-time init after clone
-    make init 2>/dev/null || true
+    log_info "Running: ${run_as} make init"
+    ${run_as} HOME="${run_home}" PATH="${build_path}" make -C "$BUILD_DIR" init 2>/dev/null || true
 
-    # Configure for VS platform
-    log_info "Running: make configure PLATFORM=${PLATFORM}"
-    make configure PLATFORM="${PLATFORM}"
+    # Configure for OCS-KVM platform with all features enabled
+    log_info "Running: ${run_as} make configure PLATFORM=${PLATFORM} \
+        INCLUDE_SYSTEM_GNMI=y \
+        INCLUDE_SYSTEM_EVENTD=y \
+        INCLUDE_SYSTEM_BMP=y \
+        INCLUDE_SYSTEM_OTEL=y \
+        INCLUDE_DHCP_RELAY=y \
+        INCLUDE_DHCP_SERVER=y \
+        INCLUDE_MACSEC=y \
+        INCLUDE_STP=y \
+        INCLUDE_ICCPD=y \
+        SONIC_INCLUDE_RESTAPI=y \
+        SONIC_INCLUDE_MUX=y \
+        ENABLE_DIALOUT=y"
+    ${run_as} HOME="${run_home}" PATH="${build_path}" make -C "$BUILD_DIR" \
+        configure \
+        PLATFORM="${PLATFORM}" \
+        INCLUDE_SYSTEM_GNMI=y \
+        INCLUDE_SYSTEM_EVENTD=y \
+        INCLUDE_SYSTEM_BMP=y \
+        INCLUDE_SYSTEM_OTEL=y \
+        INCLUDE_DHCP_RELAY=y \
+        INCLUDE_DHCP_SERVER=y \
+        INCLUDE_MACSEC=y \
+        INCLUDE_STP=y \
+        INCLUDE_ICCPD=y \
+        SONIC_INCLUDE_RESTAPI=y \
+        SONIC_INCLUDE_MUX=y \
+        ENABLE_DIALOUT=y
 
-    # Build all VS images
-    log_info "Running: make SONIC_BUILD_JOBS=${SONIC_BUILD_JOBS} BUILD_SKIP_TEST=${BUILD_SKIP_TEST} all"
-    if ! make SONIC_BUILD_JOBS="${SONIC_BUILD_JOBS}" \
+    # Build all images
+    log_info "Running: ${run_as} make SONIC_BUILD_JOBS=${SONIC_BUILD_JOBS} BUILD_SKIP_TEST=${BUILD_SKIP_TEST} all"
+    if ! ${run_as} HOME="${run_home}" PATH="${build_path}" make -C "$BUILD_DIR" \
+             SONIC_BUILD_JOBS="${SONIC_BUILD_JOBS}" \
              BUILD_SKIP_TEST="${BUILD_SKIP_TEST}" \
              all; then
         log_error "Build failed. Check ${BUILD_DIR}/build.log for details."
         return 1
     fi
 
-    # Verify the expected artifacts were produced
+    # Verify core OCS-KVM artifacts were produced
     local expected=(
-        "${BUILD_DIR}/target/docker-gbsyncd-vs.gz"
-        "${BUILD_DIR}/target/docker-database.gz"
+        "${BUILD_DIR}/target/docker-syncd-ocs-kvm.gz"
         "${BUILD_DIR}/target/docker-orchagent.gz"
+        "${BUILD_DIR}/target/docker-database.gz"
+        "${BUILD_DIR}/target/docker-eventd.gz"
+        "${BUILD_DIR}/target/docker-lldp.gz"
+        "${BUILD_DIR}/target/docker-sonic-gnmi.gz"
     )
     local missing_artifacts=()
     for f in "${expected[@]}"; do
@@ -533,53 +629,542 @@ load_images_from_archive() {
 }
 
 ###############################################################################
+# Check which required images are present in Docker
+# Sets global MISSING_IMAGES array with any that are absent
+###############################################################################
+check_missing_images() {
+    local required_images=("${CORE_IMAGES[@]}")
+
+    MISSING_IMAGES=()
+    for img in "${required_images[@]}"; do
+        if docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^${img}$"; then
+            log_info "  ✓ ${img} (present)"
+        else
+            MISSING_IMAGES+=("$img")
+            log_warn "  ✗ ${img} (missing)"
+        fi
+    done
+}
+
+###############################################################################
 # Image acquisition strategy
 ###############################################################################
 acquire_images() {
     log_step "Acquiring SONiC VS Docker images..."
 
-    # Strategy 1: Check if images are already loaded in Docker
-    local required_images=(
-        "docker-gbsyncd-vs:latest"
-        "docker-database:latest"
-        "docker-orchagent:latest"
-        "docker-eventd:latest"
-        "docker-lldp:latest"
-    )
+    # Check what we already have
+    check_missing_images
 
-    local all_present=true
-    for img in "${required_images[@]}"; do
-        if docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^${img}$"; then
-            log_info "  ✓ ${img} (already present)"
-        else
-            all_present=false
-            log_warn "  ✗ ${img} (missing)"
-        fi
-    done
-
-    if $all_present; then
+    if [ ${#MISSING_IMAGES[@]} -eq 0 ]; then
         log_success "All required images already present in Docker"
         return 0
     fi
 
-    # Strategy 2: Load from extracted .gz files
+    # Strategy 1: Load from extracted .gz files (may partially fill the gap)
     if ls "${TARGET_DIR}"/docker-*.gz 1>/dev/null 2>&1 || \
        ls "${BUILD_DIR}/target"/docker-*.gz 1>/dev/null 2>&1; then
         log_info "Found .gz image archives, loading..."
-        load_images_from_archive && return 0
+        load_images_from_archive
     fi
 
-    # Strategy 3: Extract from zip
+    # Strategy 2: Extract from zip (may partially fill the gap)
     if [ -f "${PROJECT_DIR}/sonic-buildimage.vs.zip" ]; then
         log_info "Found sonic-buildimage.vs.zip, extracting and loading..."
-        load_images_from_archive && return 0
+        load_images_from_archive
     fi
 
-    # Strategy 4: Build from source
-    log_info "No pre-built images found. Building from source..."
+    # Re-check after loading — if all images are now present, we're done
+    check_missing_images
+    if [ ${#MISSING_IMAGES[@]} -eq 0 ]; then
+        log_success "All required images are now present in Docker"
+        return 0
+    fi
+
+    # Strategy 3: Build missing images from source
+    log_info "Still missing ${#MISSING_IMAGES[@]} images: ${MISSING_IMAGES[*]}"
+    log_info "Building missing images from source..."
     clone_build_repo
     build_vs_images
+
+    # After building, load the newly built images into Docker
+    log_info "Loading newly built images into Docker..."
+    load_images_from_archive "${BUILD_DIR}/target"
+
+    # Final check
+    check_missing_images
+    if [ ${#MISSING_IMAGES[@]} -gt 0 ]; then
+        log_error "Images still missing after build: ${MISSING_IMAGES[*]}"
+        log_error "Check build logs in ${BUILD_DIR}/build.log"
+        return 1
+    fi
+
+    log_success "All required images are now available in Docker"
     return 0
+}
+
+###############################################################################
+# Generate docker-compose.yml for OCS-KVM deployment
+###############################################################################
+create_docker_compose() {
+    if [ -f "${COMPOSE_FILE}" ]; then
+        log_info "docker-compose.yml already exists, skipping"
+        return 0
+    fi
+
+    log_info "Creating docker-compose.yml for OCS-KVM platform..."
+
+    # Port mappings (override via environment)
+    local GNMI_PORT="${GNMI_PORT:-50051}"
+    local BMP_PORT="${BMP_PORT:-50052}"
+    local OTLP_GRPC_PORT="${OTLP_GRPC_PORT:-4317}"
+    local OTLP_HTTP_PORT="${OTLP_HTTP_PORT:-4318}"
+    local SNMP_PORT="${SNMP_PORT:-161}"
+    local SFLOW_PORT="${SFLOW_PORT:-6343}"
+    local MGMT_REST_PORT="${MGMT_REST_PORT:-8080}"
+    local MGMT_CLI_PORT="${MGMT_CLI_PORT:-22}"
+
+    cat > "${COMPOSE_FILE}" << COMPOSEEOF
+# SONiC Virtual Switch (OCS-KVM) — Docker Compose
+# Platform: ocs-kvm
+# Repository: https://github.com/sonic-ocs/sonic-buildimage (branch: ocs-dev)
+#
+# Core Containers:
+#   - docker-syncd-ocs-kvm   : Syncd daemon with OCS-KVM SAI
+#   - docker-orchagent       : Orchestration agent (SwSS)
+#   - docker-database        : Redis database
+#   - docker-eventd          : Event daemon
+#   - docker-lldp            : Link Layer Discovery Protocol
+#   - docker-sonic-gnmi      : gNMI interface (port ${GNMI_PORT})
+#
+# Optional Containers (enabled via build flags):
+#   - docker-sonic-bmp       : BGP Monitoring Protocol (port ${BMP_PORT})
+#   - docker-sonic-otel      : OpenTelemetry collector (ports ${OTLP_GRPC_PORT}/${OTLP_HTTP_PORT})
+#   - docker-snmp            : SNMP agent (port ${SNMP_PORT}/udp)
+#   - docker-sflow           : sFlow monitoring (port ${SFLOW_PORT}/udp)
+#   - docker-sonic-mgmt-framework : Management framework (port ${MGMT_REST_PORT})
+#   - docker-nat             : NAT support
+#   - docker-mux             : MUX for dual ToR
+#   - docker-fpm-frr         : Forwarding Plane Manager (FRR)
+#   - docker-stp             : Spanning Tree Protocol
+#   - docker-macsec          : MACsec support
+#   - docker-iccpd           : MCLAG support
+#   - docker-router-advertiser : IPv6 Router Advertisements
+
+services:
+  # ========================================================================
+  # Infrastructure
+  # ========================================================================
+
+  sonic-database:
+    image: docker-database:latest
+    container_name: sonic-database
+    restart: unless-stopped
+    networks:
+      sonic-vs-net:
+        ipv4_address: 10.255.0.2
+    volumes:
+      - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+      - ${LOG_DIR}/redis:/var/log/redis
+    environment:
+      - REDIS_LOGLEVEL=notice
+    command: >
+      bash -c "
+        supervisord -c /etc/supervisor/supervisord.conf
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    privileged: true
+
+  # ========================================================================
+  # Core OCS-KVM Containers
+  # ========================================================================
+
+  sonic-syncd:
+    image: docker-syncd-ocs-kvm:latest
+    container_name: sonic-syncd
+    restart: unless-stopped
+    networks:
+      sonic-vs-net:
+        ipv4_address: 10.255.0.3
+    volumes:
+      - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+      - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+      - ${CONFIG_DIR}/constants.yml:/etc/sonic/constants.yml
+      - ${HWSKU_DIR}:/usr/share/sonic/hwsku
+      - ${LOG_DIR}/supervisor:/var/log/supervisor
+    environment:
+      - SONIC_DB_HOST=10.255.0.2
+      - SONIC_DB_PORT=6379
+      - SAI_PROFILE_PATH=/etc/sonic/
+      - ANSIBLE_HOST_KEY_CHECKING=False
+    depends_on:
+      sonic-database:
+        condition: service_healthy
+    privileged: true
+
+  sonic-orchagent:
+    image: docker-orchagent:latest
+    container_name: sonic-orchagent
+    restart: unless-stopped
+    networks:
+      sonic-vs-net:
+        ipv4_address: 10.255.0.4
+    volumes:
+      - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+      - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+      - ${CONFIG_DIR}/constants.yml:/etc/sonic/constants.yml
+      - ${HWSKU_DIR}:/usr/share/sonic/hwsku
+      - ${LOG_DIR}/supervisor:/var/log/supervisor
+    environment:
+      - SONIC_DB_HOST=10.255.0.2
+      - SONIC_DB_PORT=6379
+      - SAI_PROFILE_PATH=/etc/sonic/
+    depends_on:
+      sonic-database:
+        condition: service_healthy
+      sonic-syncd:
+        condition: service_started
+    privileged: true
+
+  sonic-eventd:
+    image: docker-eventd:latest
+    container_name: sonic-eventd
+    restart: unless-stopped
+    networks:
+      sonic-vs-net:
+        ipv4_address: 10.255.0.5
+    volumes:
+      - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+      - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+      - ${LOG_DIR}/supervisor:/var/log/supervisor
+    environment:
+      - SONIC_DB_HOST=10.255.0.2
+      - SONIC_DB_PORT=6379
+    depends_on:
+      sonic-database:
+        condition: service_healthy
+    privileged: true
+
+  sonic-lldp:
+    image: docker-lldp:latest
+    container_name: sonic-lldp
+    restart: unless-stopped
+    networks:
+      sonic-vs-net:
+        ipv4_address: 10.255.0.6
+    volumes:
+      - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+      - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+      - ${LOG_DIR}/supervisor:/var/log/supervisor
+    environment:
+      - SONIC_DB_HOST=10.255.0.2
+      - SONIC_DB_PORT=6379
+    depends_on:
+      sonic-database:
+        condition: service_healthy
+    privileged: true
+
+  # ========================================================================
+  # gNMI — Configuration & Telemetry Interface
+  # ========================================================================
+
+  sonic-gnmi:
+    image: docker-sonic-gnmi:latest
+    container_name: sonic-gnmi
+    restart: unless-stopped
+    networks:
+      sonic-vs-net:
+        ipv4_address: 10.255.0.7
+    ports:
+      - "${GNMI_PORT}:50051"
+    volumes:
+      - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+      - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+      - ${LOG_DIR}/supervisor:/var/log/supervisor
+    environment:
+      - SONIC_DB_HOST=10.255.0.2
+      - SONIC_DB_PORT=6379
+      - GNMI_PORT=50051
+      - ENABLE_NATIVE=true
+    depends_on:
+      sonic-database:
+        condition: service_healthy
+      sonic-orchagent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f gnmi || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    privileged: true
+
+  # ========================================================================
+  # Optional Containers (commented out — enable as needed)
+  # ========================================================================
+
+  # BGP Monitoring Protocol
+  # sonic-bmp:
+  #   image: docker-sonic-bmp:latest
+  #   container_name: sonic-bmp
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.8
+  #   ports:
+  #     - "${BMP_PORT}:50052"
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # OpenTelemetry Collector
+  # sonic-otel:
+  #   image: docker-sonic-otel:latest
+  #   container_name: sonic-otel
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.9
+  #   ports:
+  #     - "${OTLP_GRPC_PORT}:4317"
+  #     - "${OTLP_HTTP_PORT}:4318"
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # SNMP Agent
+  # sonic-snmp:
+  #   image: docker-snmp:latest
+  #   container_name: sonic-snmp
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.10
+  #   ports:
+  #     - "${SNMP_PORT}:${SNMP_PORT}/udp"
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # sFlow Monitoring
+  # sonic-sflow:
+  #   image: docker-sflow:latest
+  #   container_name: sonic-sflow
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.11
+  #   ports:
+  #     - "${SFLOW_PORT}:${SFLOW_PORT}/udp"
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # Management Framework (CLI + REST)
+  # sonic-mgmt-framework:
+  #   image: docker-sonic-mgmt-framework:latest
+  #   container_name: sonic-mgmt-framework
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.12
+  #   ports:
+  #     - "${MGMT_REST_PORT}:8080"
+  #     - "${MGMT_CLI_PORT}:22"
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # Forwarding Plane Manager (FRR)
+  # sonic-fpm-frr:
+  #   image: docker-fpm-frr:latest
+  #   container_name: sonic-fpm-frr
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.13
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # NAT Support
+  # sonic-nat:
+  #   image: docker-nat:latest
+  #   container_name: sonic-nat
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.14
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # MUX for dual ToR
+  # sonic-mux:
+  #   image: docker-mux:latest
+  #   container_name: sonic-mux
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.15
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # Spanning Tree Protocol
+  # sonic-stp:
+  #   image: docker-stp:latest
+  #   container_name: sonic-stp
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.16
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # MACsec Support
+  # sonic-macsec:
+  #   image: docker-macsec:latest
+  #   container_name: sonic-macsec
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.17
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # MCLAG Support (ICCPD)
+  # sonic-iccpd:
+  #   image: docker-iccpd:latest
+  #   container_name: sonic-iccpd
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.18
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+  # IPv6 Router Advertisements
+  # sonic-router-advertiser:
+  #   image: docker-router-advertiser:latest
+  #   container_name: sonic-router-advertiser
+  #   restart: unless-stopped
+  #   networks:
+  #     sonic-vs-net:
+  #       ipv4_address: 10.255.0.19
+  #   volumes:
+  #     - ${CONFIG_DIR}/database_config.json:/etc/sonic/database_config.json
+  #     - ${CONFIG_DIR}/config_db.json:/etc/sonic/config_db.json
+  #     - ${LOG_DIR}/supervisor:/var/log/supervisor
+  #   environment:
+  #     - SONIC_DB_HOST=10.255.0.2
+  #     - SONIC_DB_PORT=6379
+  #   depends_on:
+  #     sonic-database:
+  #       condition: service_healthy
+  #   privileged: true
+
+networks:
+  sonic-vs-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.255.0.0/24
+COMPOSEEOF
+
+    log_success "docker-compose.yml created at ${COMPOSE_FILE}"
+    log_info "Core containers: syncd-ocs-kvm, orchagent, database, eventd, lldp, gnmi"
+    log_info "Optional containers are commented out — uncomment in ${COMPOSE_FILE} to enable"
 }
 
 ###############################################################################
@@ -803,10 +1388,27 @@ wait_for_redis() {
     return 1
 }
 
+wait_for_gnmi() {
+    log_info "Waiting for gNMI service to be ready..."
+    local retries=30
+    local gnmi_port="${GNMI_PORT:-50051}"
+    while [ $retries -gt 0 ]; do
+        if docker exec sonic-gnmi pgrep -f gnmi &>/dev/null 2>&1; then
+            log_success "gNMI service is ready on port ${gnmi_port}!"
+            return 0
+        fi
+        retries=$((retries - 1))
+        sleep 2
+    done
+    log_warn "gNMI service may not be fully ready yet — check logs with: bash $0 --logs sonic-gnmi"
+    return 0
+}
+
 load_config_to_redis() {
     log_info "Loading configuration into CONFIG_DB (Redis db4)..."
 
-    docker exec sonic-vs python3 -c "
+    # Use sonic-database container to load config into Redis
+    docker exec sonic-database python3 -c "
 import redis, json, sys
 
 config_file = '/etc/sonic/config_db.json'
@@ -883,6 +1485,7 @@ deploy() {
     # Setup
     setup_directories
     setup_config
+    create_docker_compose
     setup_network
 
     # Start containers
@@ -895,6 +1498,9 @@ deploy() {
     # Load config
     load_config_to_redis
 
+    # Wait for gNMI to be ready
+    wait_for_gnmi
+
     # Show status
     echo ""
     log_success "=========================================="
@@ -906,9 +1512,10 @@ deploy() {
     log_info "Quick commands:"
     log_info "  Status:  bash $0 --status"
     log_info "  Logs:    bash $0 --logs"
-    log_info "  Shell:   docker exec -it sonic-vs bash"
+    log_info "  Shell:   docker exec -it sonic-orchagent bash"
+    log_info "  gNMI:    grpcurl -plaintext localhost:${GNMI_PORT:-50051} sonic.proto.gnmi.GNMI/Capabilities"
     log_info "  Stop:    bash $0 --stop"
-    log_info "  Config:  docker exec sonic-vs sonic-db-cli CONFIG_DB keys '*'"
+    log_info "  Config:  docker exec sonic-database redis-cli -n 4 keys '*'"
 }
 
 ###############################################################################
@@ -928,11 +1535,12 @@ check_docker_running() {
 check_required_images() {
     log_info "Checking required Docker images..."
     local required_images=(
-        "docker-gbsyncd-vs:latest"
+        "docker-syncd-ocs-kvm:latest"
         "docker-database:latest"
         "docker-orchagent:latest"
         "docker-eventd:latest"
         "docker-lldp:latest"
+        "docker-sonic-gnmi:latest"
     )
 
     local missing=()
@@ -946,9 +1554,34 @@ check_required_images() {
     done
 
     if [ ${#missing[@]} -gt 0 ]; then
-        log_error "Missing images: ${missing[*]}"
-        log_error "Run: bash $0 --build-only  (or load images manually)"
-        exit 1
+        log_warn "Missing images: ${missing[*]}"
+        log_info "Automatically building missing images from source..."
+        echo ""
+
+        # Ensure repo is available
+        if [ ! -d "${BUILD_DIR}/.git" ]; then
+            clone_build_repo
+        fi
+
+        # Build all images (make will skip already-built ones)
+        build_vs_images
+
+        # Re-check after build
+        local still_missing=()
+        for img in "${missing[@]}"; do
+            if ! docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^${img}$"; then
+                still_missing+=("$img")
+            fi
+        done
+
+        if [ ${#still_missing[@]} -gt 0 ]; then
+            log_error "Images still missing after build: ${still_missing[*]}"
+            log_error "Check build logs in ${BUILD_DIR}/build.log"
+            exit 1
+        fi
+
+        log_success "All required images are now available"
+        echo ""
     fi
 }
 
@@ -976,118 +1609,30 @@ show_status() {
 }
 
 ###############################################################################
-# Full dependency install
+# Main entry point
 ###############################################################################
-install_all_deps() {
+main() {
     log_info "=========================================="
-    log_info "Installing all dependencies"
+    log_info "SONiC VS — Full Setup & Deploy"
     log_info "=========================================="
+    echo ""
+
+    progress_start
+
+    progress_render "Checking dependencies"
     check_root
     check_os
     install_packages
     install_python_tools
     install_docker
-    log_success "All dependencies installed!"
+
+    progress_render "Cloning and building OCS images"
+    acquire_images
+
+    progress_render "Deploying OCS-KVM stack"
+    deploy
+
+    progress_finish
 }
 
-###############################################################################
-# Main entry point
-###############################################################################
-main() {
-    local action="${1:---deploy}"
-
-    case "$action" in
-        --deps-only)
-            install_all_deps
-            ;;
-        --build-only)
-            check_root
-            acquire_images
-            ;;
-        --deploy-only)
-            deploy
-            ;;
-        --stop)
-            docker compose -f "${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
-            log_info "SONiC VS stopped"
-            ;;
-        --cleanup)
-            cleanup_existing
-            log_info "Full cleanup complete"
-            ;;
-        --status)
-            show_status
-            ;;
-        --dashboard)
-            detect_build_resources
-            show_dashboard
-            ;;
-        --logs)
-            shift
-            docker compose -f "${COMPOSE_FILE}" logs -f "$@" 2>/dev/null || \
-                log_warn "No containers running"
-            ;;
-        --help|-h)
-            echo "Usage: bash $0 [ACTION]"
-            echo ""
-            echo "Actions:"
-            echo "  (no arg)          Full setup: deps + images + deploy (default)"
-            echo "  --deps-only       Install system dependencies only"
-            echo "  --build-only      Build or load Docker images only"
-            echo "  --deploy-only     Deploy containers (images must exist)"
-            echo "  --stop            Stop all containers"
-            echo "  --cleanup         Stop + remove networks + interfaces"
-            echo "  --status          Show container & network status"
-            echo "  --dashboard       Show progress and next actions"
-            echo "  --logs [service]  Follow container logs"
-            echo "  --show-build-info Preview detected build resources (no build)"
-            echo ""
-            echo "Environment variables:"
-            echo "  SONIC_BRANCH         Git branch to clone (default: master)"
-            echo "  SONIC_BUILD_JOBS     Parallel build jobs (default: auto-detect)"
-            echo "  SONIC_BUILD_MEMORY   Container memory limit (default: auto-detect)"
-            echo "  PLATFORM             ASIC platform (default: vs)"
-            echo "  BUILD_SKIP_TEST      Skip tests during build (default: y)"
-            ;;
-        --show-build-info)
-            log_info "Detecting host resources..."
-            detect_build_resources
-            echo ""
-            echo "  CPUs detected:        ${DETECTED_CPUS}"
-            echo "  RAM detected:         ${DETECTED_RAM_GB} GB"
-            echo "  Free disk:            ${DETECTED_DISK_GB} GB"
-            echo "  → SONIC_BUILD_JOBS:   ${SONIC_BUILD_JOBS}"
-            echo "  → SONIC_BUILD_MEMORY: ${DETECTED_BUILD_MEMORY}"
-            echo ""
-            local est_ram=$(( SONIC_BUILD_JOBS * 6 + 4 ))
-            local est_disk=$(( SONIC_BUILD_JOBS * 30 + 70 ))
-            echo "  Estimated build cost: ~${est_ram} GB RAM, ~${est_disk} GB disk"
-            echo "  Estimated build time: ~$(( 180 / SONIC_BUILD_JOBS )) minutes (VS platform)"
-            ;;
-        *)
-            # Default: full setup + deploy
-            log_info "=========================================="
-            log_info "SONiC VS — Full Setup & Deploy"
-            log_info "=========================================="
-            echo ""
-
-            # Phase 1: Dependencies
-            log_step "Phase 1: Checking dependencies..."
-            check_root
-            check_os
-            install_packages
-            install_python_tools
-            install_docker
-
-            # Phase 2: Images
-            log_step "Phase 2: Acquiring Docker images..."
-            acquire_images
-
-            # Phase 3: Deploy
-            log_step "Phase 3: Deploying SONiC VS..."
-            deploy
-            ;;
-    esac
-}
-
-main "$@"
+main
