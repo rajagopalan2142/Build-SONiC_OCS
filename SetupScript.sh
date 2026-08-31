@@ -400,6 +400,19 @@ install_docker_compose_plugin() {
 ###############################################################################
 # Build image acquisition (clone + build OR load from archive)
 ###############################################################################
+fix_build_ownership() {
+    local run_user="${SUDO_USER:-$(whoami)}"
+    local run_group
+    run_group="$(id -gn "$run_user" 2>/dev/null || echo "$run_user")"
+
+    if [ "$(id -u)" -eq 0 ] && [ -n "$run_user" ] && [ "$run_user" != "root" ] && [ -d "$BUILD_DIR" ]; then
+        log_info "Fixing build-tree ownership for '${run_user}' before make..."
+        chown -R "$run_user:$run_group" "$BUILD_DIR" 2>/dev/null || true
+        find "$BUILD_DIR" -type d -exec chmod u+rwx,g+rwx,o+rx {} + 2>/dev/null || true
+        find "$BUILD_DIR" -type f -exec chmod u+rw,g+r,o+r {} + 2>/dev/null || true
+    fi
+}
+
 clone_build_repo() {
     log_step "Setting up sonic-buildimage repository..."
 
@@ -437,11 +450,13 @@ clone_build_repo() {
             fi
         done
 
+        fix_build_ownership
         cd "$BUILD_DIR"
         HOME="$clone_home" git fetch --all 2>/dev/null || true
         HOME="$clone_home" git checkout "$BUILD_BRANCH" 2>/dev/null || true
         HOME="$clone_home" git pull origin "$BUILD_BRANCH" 2>/dev/null || true
         HOME="$clone_home" git submodule update --init --recursive 2>/dev/null || true
+        fix_build_ownership
         log_info "Repository updated"
         return 0
     fi
@@ -450,6 +465,7 @@ clone_build_repo() {
     # Clone as the original user so that `make` (which refuses root) works
     HOME="$clone_home" git clone --recurse-submodules -b "$BUILD_BRANCH" "$BUILD_REPO" "$BUILD_DIR"
     chown -R "$clone_user:$(id -gn "$clone_user" 2>/dev/null || echo "$clone_user")" "$BUILD_DIR" 2>/dev/null || true
+    fix_build_ownership
     log_success "Repository cloned"
 }
 
@@ -521,6 +537,7 @@ build_vs_images() {
     fi
 
     # One-time init after clone
+    fix_build_ownership
     log_info "Running: ${run_as} make init"
     ${run_as} HOME="${run_home}" PATH="${build_path}" make -C "$BUILD_DIR" init 2>/dev/null || true
 
