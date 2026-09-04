@@ -27,7 +27,7 @@ LOG_DIR="${DEPLOY_DIR}/logs"
 COMPOSE_FILE="${DEPLOY_DIR}/docker-compose.yml"
 
 # Build image source (sonic-ocs upstream repo)
-BUILD_REPO="https://github.com/sonic-ocs/sonic-buildimage.git"
+BUILD_REPO="http://gitlab.embedur.local/surenmoh/sonic-ocs.git"
 BUILD_BRANCH="${SONIC_BRANCH:-ocs-dev}"
 BUILD_DIR="${PROJECT_DIR}/sonic-buildimage"
 TARGET_DIR="${PROJECT_DIR}/sonic-extracted/sonic-buildimage.vs/target"
@@ -462,8 +462,16 @@ clone_build_repo() {
     fi
 
     log_info "Cloning sonic-buildimage (branch: ${BUILD_BRANCH}) as user '${clone_user}'..."
+    # Prompt for GitLab credentials
+    echo -n "Enter GitLab username: "
+    read GITLAB_USER
+    echo -n "Enter GitLab password: "
+    read -s GITLAB_PASS
+    echo ""
+    # Embed credentials in the repo URL for authentication
+    local AUTH_REPO="http://${GITLAB_USER}:${GITLAB_PASS}@gitlab.embedur.local/surenmoh/sonic-ocs.git"
     # Clone as the original user so that `make` (which refuses root) works
-    HOME="$clone_home" git clone --recurse-submodules -b "$BUILD_BRANCH" "$BUILD_REPO" "$BUILD_DIR"
+    HOME="$clone_home" git clone --recurse-submodules -b "$BUILD_BRANCH" "$AUTH_REPO" "$BUILD_DIR"
     chown -R "$clone_user:$(id -gn "$clone_user" 2>/dev/null || echo "$clone_user")" "$BUILD_DIR" 2>/dev/null || true
     fix_build_ownership
     log_success "Repository cloned"
